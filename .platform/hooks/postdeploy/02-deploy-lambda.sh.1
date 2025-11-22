@@ -1,0 +1,95 @@
+#!/bin/bash
+set -e
+echo "[postdeploy] Deploying Lambda using AWS CLI..."
+
+ZIP_OUT="/tmp/BevFlowOrderProcessor.zip"
+LAMBDA_NAME="BevFlowOrderProcessor"
+ROLE_ARN="arn:aws:iam::815527707232:role/LabRole"
+REGION="us-east-1"
+DDB_TABLE="BevFlowOrders"
+
+# Create DynamoDB table if not exists (safe)
+aws dynamodb describe-table --table-name "$DDB_TABLE" --region $REGION >/dev/null 2>&1 || \
+aws dynamodb create-table --table-name "$DDB_TABLE" \
+  --attribute-definitions AttributeName=order_id,AttributeType=S \
+  --key-schema AttributeName=order_id,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST --region $REGION
+
+# Ensure SNS topic & SQS queue exist (idempotent)
+SNS_NAME="bevflow-orders"
+SQS_NAME="bevflow-order-queue"
+
+TOPIC_ARN=$(aws sns create-topic --name $SNS_NAME --region $REGION --query 'TopicArn' --output text)
+QUEUE_URL=$(aws sqs create-queue --queue-name $SQS_NAME --region $REGION --query 'QueueUrl' --output text)
+
+# store SSM params for other parts to read
+aws ssm put-parameter --name "/bevflow/sns-arn-24231584" --value "$TOPIC_ARN" --type String --overwrite --region $REGION
+aws ssm put-parameter --name "/bevflow/sqs-url-24231584" --value "$QUEUE_URL" --type String --overwrite --region $REGION
+
+# subscribe SQS to SNS if not already
+QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names QueueArn --region $REGION --query 'Attributes.QueueArn' --output text)
+# add permission policy so SNS can send to SQS
+POLICY=$(cat <<EOF
+{
+  "Version":"2012-10-17",
+  "Id":"${QUEUE_ARN}/SQSDefaultPolicy",
+  "Statement":[{
+    "Sid":"Allow-SNS-SendMessage",
+    "Effect":"Allow",
+    "Principal":"*",
+    "Action":"SQS:SendMessage",
+    "Resource":"$QUEUE_ARN",
+    "Condition":{"ArnEquals":{"aws:SourceArn":"$TOPIC_ARN"}}
+  }]
+}
+EOF
+)
+aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --attributes Policy="$POLICY" --region $REGION
+
+# subscribe topic -> queue
+# find if subscription exists
+EXISTS=$(aws sns list-subscriptions-by-topic --topic-arn "$TOPIC_ARN" --region $REGION --query "Subscriptions[?Endpoint=='$QUEUE_ARN'] | length(@)" --output text)
+if [ "$EXISTS" = "0" ]; then
+  aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol sqs --notification-endpoint "$QUEUE_ARN" --region $REGION
+fi
+
+# Upload ZIP to Lambda (create if not exists)
+if aws lambda get-function --function-name "$LAMBDA_NAME" --region $REGION >/dev/null 2>&1; then
+  aws lambda update-function-code --function-name "$LAMBDA_NAME" --zip-file fileb://$ZIP_OUT --region $REGION
+  echo "[postdeploy] Updated Lambda code"
+else
+  aws lambda create-function --function-name "$LAMBDA_NAME" --zip-file fileb://$ZIP_OUT \
+    --handler order_processor.lambda_handler --runtime python3.9 --role "$ROLE_ARN" --region $REGION \
+    --environment Variables="{AWS_REGION=$REGION,DDB_TABLE=$DDB_TABLE,SES_SENDER=no-reply@bevflow.com,LOGS_BUCKET=$(python3 - <<'PY'
+from bevflow.aws.s3 import get_or_create_bucket_name
+print(get_or_create_bucket_name())
+PY
+)}"
+  echo "[postdeploy] Created Lambda function"
+fi
+
+
+aws sns set-subscription-attributes \
+  --subscription-arn $(aws sns list-subscriptions-by-topic \
+      --topic-arn "$TOPIC_ARN" \
+      --query "Subscriptions[?Endpoint=='$QUEUE_ARN'].SubscriptionArn" \
+      --output text) \
+  --attribute-name RawMessageDelivery \
+  --attribute-value true
+
+# If subscription doesn't exist yet (edge case), do it after subscribe
+# So better: put it right after the subscribe command:
+if [ "$EXISTS" = "0" ]; then
+  SUB_ARN=$(aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol sqs --notification-endpoint "$QUEUE_ARN" --query 'SubscriptionArn' --output text)
+  aws sns set-subscription-attributes --subscription-arn "$SUB_ARN" --attribute-name RawMessageDelivery --attribute-value true
+  echo "[postdeploy] Enabled Raw Message Delivery"
+fi
+# Ensure event mapping SQS -> Lambda exists
+QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names QueueArn --region $REGION --query 'Attributes.QueueArn' --output text)
+MAPPINGS=$(aws lambda list-event-source-mappings --region $REGION --query "EventSourceMappings[?EventSourceArn=='$QUEUE_ARN' && FunctionArn!=null] | length(@)" --output text)
+if [ "$MAPPINGS" = "0" ]; then
+  aws lambda create-event-source-mapping --function-name "$LAMBDA_NAME" --batch-size 1 --event-source-arn "$QUEUE_ARN" --region $REGION
+  echo "[postdeploy] Created event source mapping SQS -> Lambda"
+fi
+
+echo "[postdeploy] deployment complete"

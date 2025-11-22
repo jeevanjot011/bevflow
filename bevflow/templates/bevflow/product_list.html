@@ -1,0 +1,14 @@
+{% extends 'bevflow/base.html' %}
+{% block content %}
+<h2>Your Products</h2>
+<ul>
+    {% for product in products %}
+        <li>
+            <strong>{{ product.name }}</strong> - €{{ product.price }}<br>
+            <img src="{{ product.image_url }}" width="150">
+        </li>
+    {% empty %}
+        <li>No products yet.</li>
+    {% endfor %}
+</ul>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "bevflow/base.html" %}
+
+{% block content %}
+<h2>Available Products</h2>
+
+<div style="display: flex; flex-wrap: wrap; gap: 20px;">
+    {% for p in products %}
+        <div style="
+            border: 1px solid #ddd;
+            padding: 15px;
+            width: 250px;
+            border-radius: 10px;
+            background: #fafafa;
+        ">
+            <img src="{{ p.image }}" style="width: 100%; border-radius: 8px;">
+            <h3>{{ p.name }}</h3>
+            <p>{{ p.description }}</p>
+            <p><b>Price:</b> €{{ p.price }}</p>
+
+            <a href="{% url 'order_create' p.id %}"
+               style="
+                    display: inline-block;
+                    padding: 8px 15px;
+                    background: #28a745;
+                    color: white;
+                    border-radius: 5px;
+                    text-decoration: none;
+               ">
+                Order
+            </a>
+        </div>
+    {% endfor %}
+</div>
+
+{% endblock %}
